@@ -1479,7 +1479,7 @@ void SV_ParseStringCommand(client_t *pSenderClient)
 #endif
 
 	char *s = MSG_ReadString();
-	SV_DumpIncomingStringCommand(pSenderClient, s);
+	SV_DumpIncomingPacket(pSenderClient, "clc_stringcmd_text", nullptr, 0, msg_readcount, s);
 	int ret = SV_ValidateClientCommand(s);
 	switch (ret)
 	{

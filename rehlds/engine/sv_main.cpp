@@ -4492,57 +4492,7 @@ void SV_EscapePacketDumpText(const char *src, char *dst, size_t dstSize)
 	dst[out] = 0;
 }
 
-void SV_DumpIncomingStringCommand(client_t *client, const char *command)
-{
-	if (!g_sv_packet_dump_enabled || !SV_IsPacketDumpTargetClient(client) || g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
-	{
-		return;
-	}
-
-	if (!SV_IsPacketDumpStageEnabled("clc_stringcmd_text"))
-	{
-		return;
-	}
-
-	char escaped[2048];
-	SV_EscapePacketDumpText(command, escaped, ARRAYSIZE(escaped));
-
-	g_sv_packet_dump_counter++;
-	FS_FPrintf(g_sv_packet_dump_file,
-		"\n#%u time=%.3f stage=clc_stringcmd_text cmd_len=%d addr=%s name=\"%s\" userid=%d id=%s cmd=\"%s\"\n",
-		g_sv_packet_dump_counter,
-		realtime,
-		command ? (int)Q_strlen(command) : 0,
-		SV_GetPacketDumpLogAddr(client),
-		client->name,
-		client->userid,
-		SV_GetPacketDumpLogClientID(client),
-		escaped);
-	FS_Flush(g_sv_packet_dump_file);
-}
-
-const char *SV_GetIncomingClcOpcodeName(int opcode)
-{
-	switch (opcode)
-	{
-	case clc_bad:             return "clc_bad";
-	case clc_nop:             return "clc_nop";
-	case clc_move:            return "clc_move";
-	case clc_stringcmd:       return "clc_stringcmd";
-	case clc_delta:           return "clc_delta";
-	case clc_resourcelist:    return "clc_resourcelist";
-	case clc_tmove:           return "clc_tmove";
-	case clc_fileconsistency: return "clc_fileconsistency";
-	case clc_voicedata:       return "clc_voicedata";
-	case clc_hltv:            return "clc_hltv";
-	case clc_cvarvalue:       return "clc_cvarvalue";
-	case clc_cvarvalue2:      return "clc_cvarvalue2";
-	case clc_endoflist:       return "clc_endoflist";
-	default:                  return (opcode < 0) ? "none" : "unknown";
-	}
-}
-
-void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data, int size, int readcount)
+void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data, int size, int readcount, const char *text)
 {
 	if (!g_sv_packet_dump_enabled || !SV_IsPacketDumpTargetClient(client) || g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
 	{
@@ -4554,11 +4504,29 @@ void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data
 		return;
 	}
 
+	bool hasText = (text != nullptr);
 	int opcode = (data && size > 0) ? (int)data[0] : -1;
 	bool isRawUdpStage = (stage && !Q_stricmp(stage, "raw_udp"));
 
 	g_sv_packet_dump_counter++;
-	if (isRawUdpStage)
+	if (hasText)
+	{
+		char escaped[2048];
+		SV_EscapePacketDumpText(text, escaped, ARRAYSIZE(escaped));
+
+		FS_FPrintf(g_sv_packet_dump_file,
+			"\n#%u time=%.3f stage=%s cmd_len=%d addr=%s name=\"%s\" userid=%d id=%s cmd=\"%s\"\n",
+			g_sv_packet_dump_counter,
+			realtime,
+			stage ? stage : "(null)",
+			(int)Q_strlen(text),
+			SV_GetPacketDumpLogAddr(client),
+			client->name,
+			client->userid,
+			SV_GetPacketDumpLogClientID(client),
+			escaped);
+	}
+	else if (isRawUdpStage)
 	{
 		FS_FPrintf(g_sv_packet_dump_file,
 			"\n#%u time=%.3f stage=%s size=%d readcount=%d addr=%s name=\"%s\" userid=%d id=%s\n",
@@ -4574,7 +4542,20 @@ void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data
 	}
 	else
 	{
-		const char *opcodeName = SV_GetIncomingClcOpcodeName(opcode);
+		const char *opcodeName;
+		if (opcode >= clc_bad && opcode <= clc_cvarvalue2)
+		{
+			opcodeName = sv_clcfuncs[opcode].pszname;
+		}
+		else if (opcode == clc_endoflist)
+		{
+			opcodeName = "clc_endoflist";
+		}
+		else
+		{
+			opcodeName = (opcode < 0) ? "none" : "unknown";
+		}
+
 		FS_FPrintf(g_sv_packet_dump_file,
 			"\n#%u time=%.3f stage=%s size=%d readcount=%d opcode=%d(0x%02X) opcode_name=%s addr=%s name=\"%s\" userid=%d id=%s\n",
 			g_sv_packet_dump_counter,
@@ -4591,15 +4572,22 @@ void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data
 			SV_GetPacketDumpLogClientID(client));
 	}
 
-	SV_WritePacketDumpHex(data, size);
+	if (!hasText)
+	{
+		SV_WritePacketDumpHex(data, size);
+	}
 	FS_Flush(g_sv_packet_dump_file);
 }
 
 #else // REHLDS_PACKET_DUMP
-void SV_DumpIncomingStringCommand(client_t *client, const char *command)
+void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data, int size, int readcount, const char *text)
 {
 	(void)client;
-	(void)command;
+	(void)stage;
+	(void)data;
+	(void)size;
+	(void)readcount;
+	(void)text;
 }
 #endif // REHLDS_PACKET_DUMP
 
@@ -4661,7 +4649,7 @@ void SV_ReadPackets(void)
 			bool dumpTarget = SV_IsPacketDumpTargetClient(cl);
 			if (dumpTarget)
 			{
-				SV_DumpIncomingPacket(cl, "raw_udp", net_message.data, net_message.cursize, msg_readcount);
+				SV_DumpIncomingPacket(cl, "raw_udp", net_message.data, net_message.cursize, msg_readcount, nullptr);
 
 				if (SV_IsPacketDumpStageEnabled("raw_udp_unmunged") && net_message.cursize > 8 && net_message.cursize <= NET_MAX_MESSAGE)
 				{
@@ -4673,7 +4661,7 @@ void SV_ReadPackets(void)
 					sequence = (unsigned int)LittleLong((int)sequence);
 
 					COM_UnMunge2(&unmungedPacket[8], net_message.cursize - 8, sequence & 0xFF);
-					SV_DumpIncomingPacket(cl, "raw_udp_unmunged", unmungedPacket, net_message.cursize, msg_readcount);
+					SV_DumpIncomingPacket(cl, "raw_udp_unmunged", unmungedPacket, net_message.cursize, msg_readcount, nullptr);
 				}
 			}
 #endif // REHLDS_PACKET_DUMP
@@ -4687,7 +4675,7 @@ void SV_ReadPackets(void)
 					if (payloadReadCount < 0 || payloadReadCount > net_message.cursize)
 						payloadReadCount = 0;
 
-					SV_DumpIncomingPacket(cl, "netchan_payload", &net_message.data[payloadReadCount], net_message.cursize - payloadReadCount, payloadReadCount);
+					SV_DumpIncomingPacket(cl, "netchan_payload", &net_message.data[payloadReadCount], net_message.cursize - payloadReadCount, payloadReadCount, nullptr);
 				}
 #endif // REHLDS_PACKET_DUMP
 
@@ -4707,7 +4695,7 @@ void SV_ReadPackets(void)
 #if REHLDS_PACKET_DUMP
 					if (dumpTarget)
 					{
-						SV_DumpIncomingPacket(cl, "fragment_payload", net_message.data, net_message.cursize, 0);
+						SV_DumpIncomingPacket(cl, "fragment_payload", net_message.data, net_message.cursize, 0, nullptr);
 					}
 #endif // REHLDS_PACKET_DUMP
 

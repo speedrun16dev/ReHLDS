@@ -57,6 +57,7 @@ typedef struct clc_func_s
 } clc_func_t;
 
 extern edict_t *sv_player;
+extern clc_func_t sv_clcfuncs[];
 extern sv_adjusted_positions_t truepositions[MAX_CLIENTS];
 extern qboolean g_balreadymoved;
 
