@@ -290,7 +290,7 @@ jobs:
           #export for global use
           echo "GPG_LINUX_FINGERPRINT=$GPG_LINUX_FINGERPRINT" >> $GITHUB_ENV
         shell: bash
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && secrets.PUB_ASC != '' && secrets.KEY_ASC != '' && secrets.PUB_ASC_FILE != '' && secrets.KEY_ASC_FILE != ''
 
       - name: Build and Run unittests
         run: |
@@ -402,7 +402,11 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "release" && \
                 "${{ github.event.action }}" == "published" && \
-                "${{ github.ref }}" == refs/tags/* ]]; then
+                "${{ github.ref }}" == refs/tags/* && \
+                -n "${{ secrets.PUB_ASC }}" && \
+                -n "${{ secrets.KEY_ASC }}" && \
+                -n "${{ secrets.PUB_ASC_FILE }}" && \
+                -n "${{ secrets.KEY_ASC_FILE }}" ]]; then
             echo "SIGN_READY=true" >> $GITHUB_ENV
           else
            echo "SIGN_READY=false" >> $GITHUB_ENV
