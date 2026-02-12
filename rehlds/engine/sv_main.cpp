@@ -258,6 +258,24 @@ cvar_t sv_usercmd_custom_random_seed = { "sv_usercmd_custom_random_seed", "0", 0
 cvar_t sv_rehlds_allow_large_sprays = { "sv_rehlds_allow_large_sprays", "1", 0, 1.0f, nullptr };
 #endif
 
+#ifndef REHLDS_PACKET_DUMP
+#define REHLDS_PACKET_DUMP 1
+#endif
+
+#if REHLDS_PACKET_DUMP
+cvar_t sv_packet_dump = { "sv_packet_dump", "1", 0, 1.0f, NULL };
+cvar_t sv_packet_dump_player = { "sv_packet_dump_player", "", 0, 0.0f, NULL };
+
+qboolean g_sv_packet_dump_enabled = FALSE;
+USERID_t g_sv_packet_dump_userid;
+char g_sv_packet_dump_userid_str[64] = { 0 };
+char g_sv_packet_dump_filename[MAX_PATH] = { 0 };
+FileHandle_t g_sv_packet_dump_file = FILESYSTEM_INVALID_HANDLE;
+unsigned int g_sv_packet_dump_counter = 0;
+qboolean g_sv_packet_dump_cfg_enabled = FALSE;
+char g_sv_packet_dump_cfg_target[64] = { 0 };
+#endif // REHLDS_PACKET_DUMP
+
 delta_t *SV_LookupDelta(char *name)
 {
 	delta_info_t *p = g_sv_delta;
@@ -3887,6 +3905,295 @@ void SV_SendBan(void)
 	SZ_Clear(&net_message);
 }
 
+#if REHLDS_PACKET_DUMP
+bool SV_IsPacketDumpFilenameChar(char c)
+{
+	return (c >= '0' && c <= '9')
+		|| (c >= 'a' && c <= 'z')
+		|| (c >= 'A' && c <= 'Z')
+		|| c == '_'
+		|| c == '-';
+}
+
+void SV_StopPacketDump(void)
+{
+	if (!g_sv_packet_dump_enabled)
+	{
+		return;
+	}
+
+	if (g_sv_packet_dump_file != FILESYSTEM_INVALID_HANDLE)
+	{
+		FS_FPrintf(g_sv_packet_dump_file, "Packet dump stopped at realtime=%.3f packets=%u\n", realtime, g_sv_packet_dump_counter);
+		FS_Flush(g_sv_packet_dump_file);
+		FS_Close(g_sv_packet_dump_file);
+		g_sv_packet_dump_file = FILESYSTEM_INVALID_HANDLE;
+	}
+
+	g_sv_packet_dump_enabled = FALSE;
+	g_sv_packet_dump_counter = 0;
+	g_sv_packet_dump_userid_str[0] = 0;
+	g_sv_packet_dump_filename[0] = 0;
+	Q_memset(&g_sv_packet_dump_userid, 0, sizeof(g_sv_packet_dump_userid));
+}
+
+bool SV_StartPacketDump(const char *steamid)
+{
+	if (!steamid || !steamid[0])
+	{
+		Con_Printf("pktdump: steamid is empty\n");
+		return false;
+	}
+
+	if (Q_strnicmp(steamid, "STEAM_", 6) && Q_strnicmp(steamid, "VALVE_", 6))
+	{
+		Con_Printf("pktdump: expected STEAM_X:Y:Z or VALVE_X:Y:Z\n");
+		return false;
+	}
+
+	USERID_t *id = SV_StringToUserID(steamid);
+	if (!id || (id->idtype != AUTH_IDTYPE_STEAM && id->idtype != AUTH_IDTYPE_VALVE) || !id->m_SteamID)
+	{
+		Con_Printf("pktdump: invalid steamid '%s'\n", steamid);
+		return false;
+	}
+
+	SV_StopPacketDump();
+
+	char safeId[64];
+	int safeIdLen = 0;
+	const char *resolvedId = SV_GetIDString(id);
+	const char *sourceId = resolvedId[0] ? resolvedId : steamid;
+	for (size_t i = 0; sourceId[i] && safeIdLen < ARRAYSIZE(safeId) - 1; i++)
+	{
+		char c = sourceId[i];
+		safeId[safeIdLen++] = SV_IsPacketDumpFilenameChar(c) ? c : '_';
+	}
+	safeId[safeIdLen] = 0;
+
+	const char *logsDir = Cvar_VariableString("logsdir");
+	char baseDir[MAX_PATH];
+	if (!logsDir || !logsDir[0] || Q_strstr(logsDir, ":") || Q_strstr(logsDir, ".."))
+	{
+		Q_snprintf(baseDir, sizeof(baseDir), "logs");
+	}
+	else
+	{
+		Q_snprintf(baseDir, sizeof(baseDir), "%s", logsDir);
+	}
+
+	time_t ltime;
+	time(&ltime);
+	struct tm *today = localtime(&ltime);
+
+	if (today)
+	{
+		Q_snprintf(g_sv_packet_dump_filename, sizeof(g_sv_packet_dump_filename),
+			"%s/pktdump_%04d%02d%02d_%02d%02d%02d_%s.log",
+			baseDir,
+			today->tm_year + 1900, today->tm_mon + 1, today->tm_mday,
+			today->tm_hour, today->tm_min, today->tm_sec,
+			safeId[0] ? safeId : "target");
+	}
+	else
+	{
+		Q_snprintf(g_sv_packet_dump_filename, sizeof(g_sv_packet_dump_filename),
+			"%s/pktdump_%u_%s.log", baseDir, (unsigned int)ltime, safeId[0] ? safeId : "target");
+	}
+
+	COM_FixSlashes(g_sv_packet_dump_filename);
+	COM_CreatePath(g_sv_packet_dump_filename);
+
+	g_sv_packet_dump_file = FS_OpenPathID(g_sv_packet_dump_filename, "wt", "GAMECONFIG");
+	if (g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
+	{
+		Con_Printf("pktdump: failed to open '%s'\n", g_sv_packet_dump_filename);
+		g_sv_packet_dump_filename[0] = 0;
+		return false;
+	}
+
+	g_sv_packet_dump_userid = *id;
+	Q_strncpy(g_sv_packet_dump_userid_str, sourceId, ARRAYSIZE(g_sv_packet_dump_userid_str) - 1);
+	g_sv_packet_dump_userid_str[ARRAYSIZE(g_sv_packet_dump_userid_str) - 1] = 0;
+	g_sv_packet_dump_enabled = TRUE;
+	g_sv_packet_dump_counter = 0;
+
+	FS_FPrintf(g_sv_packet_dump_file, "Packet dump started\n");
+	FS_FPrintf(g_sv_packet_dump_file, "target=\"%s\" steamid64=%lld realtime=%.3f\n", g_sv_packet_dump_userid_str, (long long)g_sv_packet_dump_userid.m_SteamID, realtime);
+	FS_FPrintf(g_sv_packet_dump_file, "file=\"%s\"\n", g_sv_packet_dump_filename);
+	FS_Flush(g_sv_packet_dump_file);
+
+	Con_Printf("pktdump: started for %s, writing to %s\n", g_sv_packet_dump_userid_str, g_sv_packet_dump_filename);
+	return true;
+}
+
+void SV_SyncPacketDumpFromCvars(void)
+{
+	char target[sizeof(g_sv_packet_dump_cfg_target)];
+	target[0] = 0;
+
+	if (sv_packet_dump_player.string && sv_packet_dump_player.string[0])
+	{
+		TrimSpace(sv_packet_dump_player.string, target);
+		target[ARRAYSIZE(target) - 1] = 0;
+	}
+
+	qboolean wantEnabled = (sv_packet_dump.value != 0.0f && target[0] != 0) ? TRUE : FALSE;
+	if (wantEnabled == g_sv_packet_dump_cfg_enabled && !Q_stricmp(target, g_sv_packet_dump_cfg_target))
+	{
+		return;
+	}
+
+	g_sv_packet_dump_cfg_enabled = wantEnabled;
+	Q_strncpy(g_sv_packet_dump_cfg_target, target, ARRAYSIZE(g_sv_packet_dump_cfg_target) - 1);
+	g_sv_packet_dump_cfg_target[ARRAYSIZE(g_sv_packet_dump_cfg_target) - 1] = 0;
+
+	if (!wantEnabled)
+	{
+		if (g_sv_packet_dump_enabled)
+		{
+			SV_StopPacketDump();
+			Con_Printf("pktdump: disabled by cvars\n");
+		}
+		return;
+	}
+
+	SV_StartPacketDump(target);
+}
+
+bool SV_IsPacketDumpTargetClient(client_t *client)
+{
+	if (!g_sv_packet_dump_enabled || !client)
+	{
+		return false;
+	}
+
+	if (!client->connected && !client->active && !client->spawned)
+	{
+		return false;
+	}
+
+	return SV_CompareUserID(&client->network_userid, &g_sv_packet_dump_userid) ? true : false;
+}
+
+void SV_WritePacketDumpHex(const byte *data, int size)
+{
+	if (!data || size <= 0 || g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
+	{
+		return;
+	}
+
+	for (int offset = 0; offset < size; offset += 16)
+	{
+		char hex[16 * 3 + 1];
+		char ascii[17];
+		int cursor = 0;
+		int lineSize = (size - offset > 16) ? 16 : (size - offset);
+
+		for (int i = 0; i < lineSize; i++)
+		{
+			unsigned char b = data[offset + i];
+			hex[cursor++] = "0123456789ABCDEF"[b >> 4];
+			hex[cursor++] = "0123456789ABCDEF"[b & 0x0F];
+			hex[cursor++] = ' ';
+			ascii[i] = (b >= 32 && b <= 126) ? b : '.';
+		}
+
+		for (int i = lineSize; i < 16; i++)
+		{
+			hex[cursor++] = ' ';
+			hex[cursor++] = ' ';
+			hex[cursor++] = ' ';
+		}
+
+		hex[cursor] = 0;
+		ascii[lineSize] = 0;
+		FS_FPrintf(g_sv_packet_dump_file, "%04X  %s |%s|\n", offset, hex, ascii);
+	}
+}
+
+const char *SV_GetIncomingClcOpcodeName(int opcode)
+{
+	switch (opcode)
+	{
+	case clc_bad:             return "clc_bad";
+	case clc_nop:             return "clc_nop";
+	case clc_move:            return "clc_move";
+	case clc_stringcmd:       return "clc_stringcmd";
+	case clc_delta:           return "clc_delta";
+	case clc_resourcelist:    return "clc_resourcelist";
+	case clc_tmove:           return "clc_tmove";
+	case clc_fileconsistency: return "clc_fileconsistency";
+	case clc_voicedata:       return "clc_voicedata";
+	case clc_hltv:            return "clc_hltv";
+	case clc_cvarvalue:       return "clc_cvarvalue";
+	case clc_cvarvalue2:      return "clc_cvarvalue2";
+	case clc_endoflist:       return "clc_endoflist";
+	default:                  return (opcode < 0) ? "none" : "unknown";
+	}
+}
+
+void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data, int size, int readcount)
+{
+	if (!g_sv_packet_dump_enabled || !SV_IsPacketDumpTargetClient(client) || g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
+	{
+		return;
+	}
+
+	int opcode = (data && size > 0) ? (int)data[0] : -1;
+	const char *opcodeName = SV_GetIncomingClcOpcodeName(opcode);
+
+	g_sv_packet_dump_counter++;
+	FS_FPrintf(g_sv_packet_dump_file,
+		"\n#%u time=%.3f stage=%s size=%d readcount=%d opcode=%d(0x%02X) opcode_name=%s addr=%s name=\"%s\" userid=%d id=%s\n",
+		g_sv_packet_dump_counter,
+		realtime,
+		stage ? stage : "(null)",
+		size,
+		readcount,
+		opcode,
+		(opcode >= 0) ? (opcode & 0xFF) : 0,
+		opcodeName,
+		NET_AdrToString(client->netchan.remote_address),
+		client->name,
+		client->userid,
+		SV_GetClientIDString(client));
+
+	SV_WritePacketDumpHex(data, size);
+	FS_Flush(g_sv_packet_dump_file);
+}
+
+void SV_PacketDump_f(void)
+{
+	if (Cmd_Argc() != 2)
+	{
+		Con_Printf("usage: pktdump <STEAM_X:Y:Z | VALVE_X:Y:Z | off>\n");
+		Con_Printf("cvars: sv_packet_dump <0|1>, sv_packet_dump_player <steamid>\n");
+		if (g_sv_packet_dump_enabled)
+		{
+			Con_Printf("pktdump: active target=%s file=%s\n", g_sv_packet_dump_userid_str, g_sv_packet_dump_filename);
+		}
+		else
+		{
+			Con_Printf("pktdump: disabled\n");
+		}
+		return;
+	}
+
+	const char *arg = Cmd_Argv(1);
+	if (!Q_stricmp(arg, "off") || !Q_stricmp(arg, "0"))
+	{
+		Cvar_DirectSet(&sv_packet_dump_player, "");
+		SV_SyncPacketDumpFromCvars();
+		return;
+	}
+
+	Cvar_DirectSet(&sv_packet_dump, "1");
+	Cvar_DirectSet(&sv_packet_dump_player, arg);
+	SV_SyncPacketDumpFromCvars();
+}
+#endif // REHLDS_PACKET_DUMP
+
 bool EXT_FUNC NET_GetPacketPreprocessor(uint8* data, unsigned int len, const netadr_t& srcAddr)
 {
 	return true;
@@ -3941,8 +4248,27 @@ void SV_ReadPackets(void)
 				continue;
 			}
 
+#if REHLDS_PACKET_DUMP
+			bool dumpTarget = SV_IsPacketDumpTargetClient(cl);
+			if (dumpTarget)
+			{
+				SV_DumpIncomingPacket(cl, "raw_udp", net_message.data, net_message.cursize, msg_readcount);
+			}
+#endif // REHLDS_PACKET_DUMP
+
 			if (Netchan_Process(&cl->netchan))
 			{
+#if REHLDS_PACKET_DUMP
+				if (dumpTarget)
+				{
+					int payloadReadCount = msg_readcount;
+					if (payloadReadCount < 0 || payloadReadCount > net_message.cursize)
+						payloadReadCount = 0;
+
+					SV_DumpIncomingPacket(cl, "netchan_payload", &net_message.data[payloadReadCount], net_message.cursize - payloadReadCount, payloadReadCount);
+				}
+#endif // REHLDS_PACKET_DUMP
+
 				if (g_psvs.maxclients == 1 || !cl->active || !cl->spawned || !cl->fully_connected)
 				{
 					cl->send_message = TRUE;
@@ -3956,6 +4282,13 @@ void SV_ReadPackets(void)
 			{
 				if (Netchan_CopyNormalFragments(&cl->netchan))
 				{
+#if REHLDS_PACKET_DUMP
+					if (dumpTarget)
+					{
+						SV_DumpIncomingPacket(cl, "fragment_payload", net_message.data, net_message.cursize, 0);
+					}
+#endif // REHLDS_PACKET_DUMP
+
 					MSG_BeginReading();
 					SV_ExecuteClientMessage(cl);
 				}
@@ -8108,6 +8441,9 @@ void EXT_FUNC SV_Frame_Internal()
 	gGlobalVariables.frametime = host_frametime;
 	g_psv.oldtime = g_psv.time;
 	SV_CheckCmdTimes();
+#if REHLDS_PACKET_DUMP
+	SV_SyncPacketDumpFromCvars();
+#endif
 	SV_ReadPackets();
 	if (SV_IsSimulating())
 	{
@@ -8228,6 +8564,9 @@ void SV_Init(void)
 	Cmd_AddCommand("logaddress_add", SV_AddLogAddress_f);
 	Cmd_AddCommand("logaddress_del", SV_DelLogAddress_f);
 	Cmd_AddCommand("log", SV_ServerLog_f);
+#if REHLDS_PACKET_DUMP
+	Cmd_AddCommand("pktdump", SV_PacketDump_f);
+#endif
 	Cmd_AddCommand("serverinfo", SV_Serverinfo_f);
 	Cmd_AddCommand("localinfo", SV_Localinfo_f);
 	Cmd_AddCommand("showinfo", SV_ShowServerinfo_f);
@@ -8358,6 +8697,10 @@ void SV_Init(void)
 	Cvar_RegisterVariable(&sv_usercmd_custom_random_seed);
 	Cvar_RegisterVariable(&sv_rehlds_allow_large_sprays);
 #endif
+#if REHLDS_PACKET_DUMP
+	Cvar_RegisterVariable(&sv_packet_dump);
+	Cvar_RegisterVariable(&sv_packet_dump_player);
+#endif
 
 	//------------------------------------------------
 	// Movevars cvarhook registers
@@ -8414,6 +8757,10 @@ void SV_Init(void)
 
 void SV_Shutdown(void)
 {
+#if REHLDS_PACKET_DUMP
+	SV_StopPacketDump();
+#endif
+
 #if (defined(REHLDS_OPT_PEDANTIC) || defined(REHLDS_FIXES)) && defined REHLDS_JIT
 	g_DeltaJitRegistry.Cleanup();
 #endif
