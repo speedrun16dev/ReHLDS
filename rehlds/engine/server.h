@@ -525,6 +525,7 @@ void SV_CheckRate(client_t *cl);
 void SV_ProcessFile(client_t *cl, char *filename);
 qboolean SV_FilterPacket(void);
 void SV_SendBan(void);
+void SV_DumpIncomingStringCommand(client_t *client, const char *command);
 void SV_ReadPackets(void);
 void SV_CheckTimeouts(void);
 int SV_CalcPing(client_t *cl);

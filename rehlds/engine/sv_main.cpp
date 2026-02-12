@@ -4112,6 +4112,78 @@ void SV_WritePacketDumpHex(const byte *data, int size)
 	}
 }
 
+void SV_EscapePacketDumpText(const char *src, char *dst, size_t dstSize)
+{
+	dst[0] = 0;
+	if (!src || dstSize <= 1)
+	{
+		return;
+	}
+
+	const char *hex = "0123456789ABCDEF";
+	size_t out = 0;
+	for (size_t i = 0; src[i] && out + 1 < dstSize; i++)
+	{
+		unsigned char c = (unsigned char)src[i];
+		if (c == '\\' || c == '\"')
+		{
+			if (out + 2 >= dstSize)
+				break;
+			dst[out++] = '\\';
+			dst[out++] = (char)c;
+			continue;
+		}
+
+		if (c == '\n' || c == '\r' || c == '\t')
+		{
+			if (out + 2 >= dstSize)
+				break;
+			dst[out++] = '\\';
+			dst[out++] = (c == '\n') ? 'n' : ((c == '\r') ? 'r' : 't');
+			continue;
+		}
+
+		if (c >= 32 && c <= 126)
+		{
+			dst[out++] = (char)c;
+			continue;
+		}
+
+		if (out + 4 >= dstSize)
+			break;
+		dst[out++] = '\\';
+		dst[out++] = 'x';
+		dst[out++] = hex[(c >> 4) & 0x0F];
+		dst[out++] = hex[c & 0x0F];
+	}
+
+	dst[out] = 0;
+}
+
+void SV_DumpIncomingStringCommand(client_t *client, const char *command)
+{
+	if (!g_sv_packet_dump_enabled || !SV_IsPacketDumpTargetClient(client) || g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
+	{
+		return;
+	}
+
+	char escaped[2048];
+	SV_EscapePacketDumpText(command, escaped, ARRAYSIZE(escaped));
+
+	g_sv_packet_dump_counter++;
+	FS_FPrintf(g_sv_packet_dump_file,
+		"\n#%u time=%.3f stage=clc_stringcmd_text cmd_len=%d addr=%s name=\"%s\" userid=%d id=%s cmd=\"%s\"\n",
+		g_sv_packet_dump_counter,
+		realtime,
+		command ? (int)Q_strlen(command) : 0,
+		NET_AdrToString(client->netchan.remote_address),
+		client->name,
+		client->userid,
+		SV_GetClientIDString(client),
+		escaped);
+	FS_Flush(g_sv_packet_dump_file);
+}
+
 const char *SV_GetIncomingClcOpcodeName(int opcode)
 {
 	switch (opcode)
@@ -4141,23 +4213,41 @@ void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data
 	}
 
 	int opcode = (data && size > 0) ? (int)data[0] : -1;
-	const char *opcodeName = SV_GetIncomingClcOpcodeName(opcode);
+	bool isRawUdpStage = (stage && !Q_stricmp(stage, "raw_udp"));
 
 	g_sv_packet_dump_counter++;
-	FS_FPrintf(g_sv_packet_dump_file,
-		"\n#%u time=%.3f stage=%s size=%d readcount=%d opcode=%d(0x%02X) opcode_name=%s addr=%s name=\"%s\" userid=%d id=%s\n",
-		g_sv_packet_dump_counter,
-		realtime,
-		stage ? stage : "(null)",
-		size,
-		readcount,
-		opcode,
-		(opcode >= 0) ? (opcode & 0xFF) : 0,
-		opcodeName,
-		NET_AdrToString(client->netchan.remote_address),
-		client->name,
-		client->userid,
-		SV_GetClientIDString(client));
+	if (isRawUdpStage)
+	{
+		FS_FPrintf(g_sv_packet_dump_file,
+			"\n#%u time=%.3f stage=%s size=%d readcount=%d addr=%s name=\"%s\" userid=%d id=%s\n",
+			g_sv_packet_dump_counter,
+			realtime,
+			stage,
+			size,
+			readcount,
+			NET_AdrToString(client->netchan.remote_address),
+			client->name,
+			client->userid,
+			SV_GetClientIDString(client));
+	}
+	else
+	{
+		const char *opcodeName = SV_GetIncomingClcOpcodeName(opcode);
+		FS_FPrintf(g_sv_packet_dump_file,
+			"\n#%u time=%.3f stage=%s size=%d readcount=%d opcode=%d(0x%02X) opcode_name=%s addr=%s name=\"%s\" userid=%d id=%s\n",
+			g_sv_packet_dump_counter,
+			realtime,
+			stage ? stage : "(null)",
+			size,
+			readcount,
+			opcode,
+			(opcode >= 0) ? (opcode & 0xFF) : 0,
+			opcodeName,
+			NET_AdrToString(client->netchan.remote_address),
+			client->name,
+			client->userid,
+			SV_GetClientIDString(client));
+	}
 
 	SV_WritePacketDumpHex(data, size);
 	FS_Flush(g_sv_packet_dump_file);
@@ -4191,6 +4281,12 @@ void SV_PacketDump_f(void)
 	Cvar_DirectSet(&sv_packet_dump, "1");
 	Cvar_DirectSet(&sv_packet_dump_player, arg);
 	SV_SyncPacketDumpFromCvars();
+}
+#else // REHLDS_PACKET_DUMP
+void SV_DumpIncomingStringCommand(client_t *client, const char *command)
+{
+	(void)client;
+	(void)command;
 }
 #endif // REHLDS_PACKET_DUMP
 
