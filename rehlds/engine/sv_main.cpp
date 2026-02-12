@@ -4003,38 +4003,25 @@ qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t tar
 		return TRUE;
 	}
 
-	char buf[128];
+	char buf[256];
 	TrimSpace(spec, buf);
 	buf[ARRAYSIZE(buf) - 1] = 0;
 
 	const char *s = buf;
-	while (*s && isspace((unsigned char)*s))
-		s++;
-
-	size_t out = 0;
-	while (*s && !isspace((unsigned char)*s) && out + 1 < targetSize)
-	{
-		target[out++] = *s++;
-	}
-	target[out] = 0;
-
-	while (*s && isspace((unsigned char)*s))
-		s++;
-
 	bool hasStageTokens = false;
 	unsigned int parsedStageMask = 0;
-	bool seenAnonymized = false;
+
 	char token[64];
 	while (*s)
 	{
-		while (*s && (isspace((unsigned char)*s) || *s == ','))
+		while (*s && isspace((unsigned char)*s))
 			s++;
 
 		if (!*s)
 			break;
 
 		size_t i = 0;
-		while (*s && !isspace((unsigned char)*s) && *s != ',' && i + 1 < ARRAYSIZE(token))
+		while (*s && !isspace((unsigned char)*s) && i + 1 < ARRAYSIZE(token))
 		{
 			token[i++] = *s++;
 		}
@@ -4043,25 +4030,72 @@ qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t tar
 		if (!token[0])
 			continue;
 
-		if (!Q_stricmp(token, "anonymized"))
+		if (!Q_strnicmp(token, "steamid:", 8))
 		{
-			if (seenAnonymized)
+			const char *value = token + 8;
+			if (!value[0])
 			{
 				return FALSE;
 			}
 
-			seenAnonymized = true;
-			*anonymized = TRUE;
+			Q_strncpy(target, value, targetSize - 1);
+			target[targetSize - 1] = 0;
 			continue;
 		}
 
-		if (seenAnonymized)
+		if (!Q_strnicmp(token, "stages:", 7))
 		{
-			return FALSE;
+			const char *value = token + 7;
+			if (!value[0])
+			{
+				return FALSE;
+			}
+
+			hasStageTokens = true;
+			parsedStageMask = 0;
+
+			char stageToken[64];
+			size_t n = 0;
+			for (size_t k = 0; ; k++)
+			{
+				char c = value[k];
+				if (c == ',' || c == 0)
+				{
+					stageToken[n] = 0;
+					if (stageToken[0])
+					{
+						parsedStageMask |= SV_GetPacketDumpStageMaskByName(stageToken);
+					}
+					n = 0;
+					if (c == 0)
+						break;
+					continue;
+				}
+
+				if (n + 1 < ARRAYSIZE(stageToken))
+				{
+					stageToken[n++] = c;
+				}
+			}
+
+			continue;
 		}
 
-		hasStageTokens = true;
-		parsedStageMask |= SV_GetPacketDumpStageMaskByName(token);
+		if (!Q_strnicmp(token, "mode:", 5))
+		{
+			const char *value = token + 5;
+			if (!Q_stricmp(value, "anonymized"))
+			{
+				*anonymized = TRUE;
+			}
+			else
+			{
+				return FALSE;
+			}
+			continue;
+		}
+
+		return FALSE;
 	}
 
 	if (hasStageTokens)
