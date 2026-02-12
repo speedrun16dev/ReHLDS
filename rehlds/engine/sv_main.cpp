@@ -266,6 +266,16 @@ cvar_t sv_rehlds_allow_large_sprays = { "sv_rehlds_allow_large_sprays", "1", 0, 
 cvar_t sv_packet_dump = { "sv_packet_dump", "1", 0, 1.0f, NULL };
 cvar_t sv_packet_dump_player = { "sv_packet_dump_player", "", 0, 0.0f, NULL };
 
+enum
+{
+	PKTDUMP_STAGE_RAW_UDP = (1u << 0),
+	PKTDUMP_STAGE_RAW_UDP_UNMUNGED = (1u << 1),
+	PKTDUMP_STAGE_NETCHAN_PAYLOAD = (1u << 2),
+	PKTDUMP_STAGE_FRAGMENT_PAYLOAD = (1u << 3),
+	PKTDUMP_STAGE_CLC_STRINGCMD_TEXT = (1u << 4),
+	PKTDUMP_STAGE_ALL = PKTDUMP_STAGE_RAW_UDP | PKTDUMP_STAGE_RAW_UDP_UNMUNGED | PKTDUMP_STAGE_NETCHAN_PAYLOAD | PKTDUMP_STAGE_FRAGMENT_PAYLOAD | PKTDUMP_STAGE_CLC_STRINGCMD_TEXT
+};
+
 qboolean g_sv_packet_dump_enabled = FALSE;
 USERID_t g_sv_packet_dump_userid;
 char g_sv_packet_dump_userid_str[64] = { 0 };
@@ -276,6 +286,7 @@ qboolean g_sv_packet_dump_cfg_enabled = FALSE;
 char g_sv_packet_dump_cfg_target[64] = { 0 };
 qboolean g_sv_packet_dump_target_online = FALSE;
 qboolean g_sv_packet_dump_cfg_anonymized = FALSE;
+unsigned int g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
 #endif // REHLDS_PACKET_DUMP
 
 delta_t *SV_LookupDelta(char *name)
@@ -3917,14 +3928,79 @@ bool SV_IsPacketDumpFilenameChar(char c)
 		|| c == '-';
 }
 
-void SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t targetSize, qboolean *anonymized)
+unsigned int SV_GetPacketDumpStageMaskByName(const char *name)
+{
+	if (!name || !name[0])
+	{
+		return 0;
+	}
+
+	if (!Q_stricmp(name, "raw_udp"))
+		return PKTDUMP_STAGE_RAW_UDP;
+	if (!Q_stricmp(name, "raw_udp_unmunged"))
+		return PKTDUMP_STAGE_RAW_UDP_UNMUNGED;
+	if (!Q_stricmp(name, "netchan_payload"))
+		return PKTDUMP_STAGE_NETCHAN_PAYLOAD;
+	if (!Q_stricmp(name, "fragment_payload"))
+		return PKTDUMP_STAGE_FRAGMENT_PAYLOAD;
+	if (!Q_stricmp(name, "clc_stringcmd_text"))
+		return PKTDUMP_STAGE_CLC_STRINGCMD_TEXT;
+
+	return 0;
+}
+
+bool SV_IsPacketDumpStageEnabled(const char *stage)
+{
+	unsigned int stageMask = SV_GetPacketDumpStageMaskByName(stage);
+	if (stageMask == 0)
+	{
+		return (g_sv_packet_dump_cfg_stage_mask == PKTDUMP_STAGE_ALL);
+	}
+
+	return (g_sv_packet_dump_cfg_stage_mask & stageMask) ? true : false;
+}
+
+void SV_BuildPacketDumpStageList(unsigned int stageMask, char *out, size_t outSize)
+{
+	if (!outSize)
+	{
+		return;
+	}
+	out[0] = 0;
+
+	const struct
+	{
+		unsigned int mask;
+		const char *name;
+	} stageItems[] = {
+		{ PKTDUMP_STAGE_RAW_UDP, "raw_udp" },
+		{ PKTDUMP_STAGE_RAW_UDP_UNMUNGED, "raw_udp_unmunged" },
+		{ PKTDUMP_STAGE_NETCHAN_PAYLOAD, "netchan_payload" },
+		{ PKTDUMP_STAGE_FRAGMENT_PAYLOAD, "fragment_payload" },
+		{ PKTDUMP_STAGE_CLC_STRINGCMD_TEXT, "clc_stringcmd_text" }
+	};
+
+	bool first = true;
+	for (size_t i = 0; i < ARRAYSIZE(stageItems); i++)
+	{
+		if (!(stageMask & stageItems[i].mask))
+			continue;
+
+		size_t offset = Q_strlen(out);
+		Q_snprintf(out + offset, outSize - offset, "%s%s", first ? "" : ",", stageItems[i].name);
+		first = false;
+	}
+}
+
+qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t targetSize, qboolean *anonymized, unsigned int *stageMask)
 {
 	target[0] = 0;
 	*anonymized = FALSE;
+	*stageMask = PKTDUMP_STAGE_ALL;
 
 	if (!spec || !spec[0] || targetSize <= 1)
 	{
-		return;
+		return TRUE;
 	}
 
 	char buf[128];
@@ -3945,10 +4021,55 @@ void SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t targetS
 	while (*s && isspace((unsigned char)*s))
 		s++;
 
-	if (*s && !Q_stricmp(s, "anonymized"))
+	bool hasStageTokens = false;
+	unsigned int parsedStageMask = 0;
+	bool seenAnonymized = false;
+	char token[64];
+	while (*s)
 	{
-		*anonymized = TRUE;
+		while (*s && (isspace((unsigned char)*s) || *s == ','))
+			s++;
+
+		if (!*s)
+			break;
+
+		size_t i = 0;
+		while (*s && !isspace((unsigned char)*s) && *s != ',' && i + 1 < ARRAYSIZE(token))
+		{
+			token[i++] = *s++;
+		}
+		token[i] = 0;
+
+		if (!token[0])
+			continue;
+
+		if (!Q_stricmp(token, "anonymized"))
+		{
+			if (seenAnonymized)
+			{
+				return FALSE;
+			}
+
+			seenAnonymized = true;
+			*anonymized = TRUE;
+			continue;
+		}
+
+		if (seenAnonymized)
+		{
+			return FALSE;
+		}
+
+		hasStageTokens = true;
+		parsedStageMask |= SV_GetPacketDumpStageMaskByName(token);
 	}
+
+	if (hasStageTokens)
+	{
+		*stageMask = parsedStageMask;
+	}
+
+	return TRUE;
 }
 
 const char *SV_GetPacketDumpLogAddr(client_t *client)
@@ -3992,6 +4113,7 @@ void SV_StopPacketDump(void)
 	g_sv_packet_dump_filename[0] = 0;
 	g_sv_packet_dump_target_online = FALSE;
 	g_sv_packet_dump_cfg_anonymized = FALSE;
+	g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
 	Q_memset(&g_sv_packet_dump_userid, 0, sizeof(g_sv_packet_dump_userid));
 }
 
@@ -4094,6 +4216,8 @@ bool SV_StartPacketDump(const char *steamid)
 	const char *logTarget = g_sv_packet_dump_cfg_anonymized ? "******" : g_sv_packet_dump_userid_str;
 	const char *logFile = g_sv_packet_dump_cfg_anonymized ? "******" : g_sv_packet_dump_filename;
 	char logSteamId64[32];
+	char stageList[128];
+	SV_BuildPacketDumpStageList(g_sv_packet_dump_cfg_stage_mask, stageList, sizeof(stageList));
 	if (g_sv_packet_dump_cfg_anonymized)
 	{
 		Q_snprintf(logSteamId64, sizeof(logSteamId64), "******");
@@ -4105,6 +4229,7 @@ bool SV_StartPacketDump(const char *steamid)
 
 	FS_FPrintf(g_sv_packet_dump_file, "Packet dump started\n");
 	FS_FPrintf(g_sv_packet_dump_file, "target=\"%s\" steamid64=%s realtime=%.3f\n", logTarget, logSteamId64, realtime);
+	FS_FPrintf(g_sv_packet_dump_file, "stages=\"%s\"\n", stageList);
 	FS_FPrintf(g_sv_packet_dump_file, "file=\"%s\"\n", logFile);
 	FS_Flush(g_sv_packet_dump_file);
 
@@ -4142,16 +4267,30 @@ void SV_SyncPacketDumpFromCvars(void)
 	char target[sizeof(g_sv_packet_dump_cfg_target)];
 	target[0] = 0;
 	qboolean anonymized = FALSE;
+	unsigned int stageMask = PKTDUMP_STAGE_ALL;
+	qboolean validSpec = TRUE;
 
 	if (sv_packet_dump_player.string && sv_packet_dump_player.string[0])
 	{
-		SV_ParsePacketDumpPlayerSpec(sv_packet_dump_player.string, target, ARRAYSIZE(target), &anonymized);
+		validSpec = SV_ParsePacketDumpPlayerSpec(sv_packet_dump_player.string, target, ARRAYSIZE(target), &anonymized, &stageMask);
+		if (!validSpec)
+		{
+			target[0] = 0;
+		}
 	}
 
 	qboolean wantEnabled = (sv_packet_dump.value != 0.0f && target[0] != 0) ? TRUE : FALSE;
-	if (wantEnabled == g_sv_packet_dump_cfg_enabled && !Q_stricmp(target, g_sv_packet_dump_cfg_target) && anonymized == g_sv_packet_dump_cfg_anonymized)
+	if (wantEnabled == g_sv_packet_dump_cfg_enabled
+		&& !Q_stricmp(target, g_sv_packet_dump_cfg_target)
+		&& anonymized == g_sv_packet_dump_cfg_anonymized
+		&& stageMask == g_sv_packet_dump_cfg_stage_mask)
 	{
 		if (!wantEnabled)
+		{
+			return;
+		}
+
+		if (stageMask == 0)
 		{
 			return;
 		}
@@ -4182,6 +4321,7 @@ void SV_SyncPacketDumpFromCvars(void)
 	Q_strncpy(g_sv_packet_dump_cfg_target, target, ARRAYSIZE(g_sv_packet_dump_cfg_target) - 1);
 	g_sv_packet_dump_cfg_target[ARRAYSIZE(g_sv_packet_dump_cfg_target) - 1] = 0;
 	g_sv_packet_dump_cfg_anonymized = anonymized;
+	g_sv_packet_dump_cfg_stage_mask = stageMask;
 
 	if (!wantEnabled)
 	{
@@ -4192,6 +4332,18 @@ void SV_SyncPacketDumpFromCvars(void)
 		}
 		g_sv_packet_dump_target_online = FALSE;
 		g_sv_packet_dump_cfg_anonymized = FALSE;
+		g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
+		return;
+	}
+
+	if (stageMask == 0)
+	{
+		Con_Printf("pktdump: no valid stages in sv_packet_dump_player spec\n");
+		if (g_sv_packet_dump_enabled || g_sv_packet_dump_file != FILESYSTEM_INVALID_HANDLE)
+		{
+			SV_ClosePacketDumpSession();
+		}
+		g_sv_packet_dump_target_online = FALSE;
 		return;
 	}
 
@@ -4205,6 +4357,7 @@ void SV_SyncPacketDumpFromCvars(void)
 		g_sv_packet_dump_cfg_target[0] = 0;
 		g_sv_packet_dump_target_online = FALSE;
 		g_sv_packet_dump_cfg_anonymized = FALSE;
+		g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
 	}
 }
 
@@ -4314,6 +4467,11 @@ void SV_DumpIncomingStringCommand(client_t *client, const char *command)
 		return;
 	}
 
+	if (!SV_IsPacketDumpStageEnabled("clc_stringcmd_text"))
+	{
+		return;
+	}
+
 	char escaped[2048];
 	SV_EscapePacketDumpText(command, escaped, ARRAYSIZE(escaped));
 
@@ -4359,6 +4517,11 @@ void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data
 		return;
 	}
 
+	if (!SV_IsPacketDumpStageEnabled(stage))
+	{
+		return;
+	}
+
 	int opcode = (data && size > 0) ? (int)data[0] : -1;
 	bool isRawUdpStage = (stage && !Q_stricmp(stage, "raw_udp"));
 
@@ -4400,50 +4563,6 @@ void SV_DumpIncomingPacket(client_t *client, const char *stage, const byte *data
 	FS_Flush(g_sv_packet_dump_file);
 }
 
-void SV_PacketDump_f(void)
-{
-	if (Cmd_Argc() < 2 || Cmd_Argc() > 3)
-	{
-		Con_Printf("usage: pktdump <STEAM_X:Y:Z | VALVE_X:Y:Z | off> [anonymized]\n");
-		Con_Printf("cvars: sv_packet_dump <0|1>, sv_packet_dump_player \"<steamid> [anonymized]\"\n");
-		if (g_sv_packet_dump_enabled)
-		{
-			Con_Printf("pktdump: active target=%s file=%s\n", g_sv_packet_dump_userid_str, g_sv_packet_dump_filename);
-		}
-		else
-		{
-			Con_Printf("pktdump: disabled\n");
-		}
-		return;
-	}
-
-	const char *arg = Cmd_Argv(1);
-	if (!Q_stricmp(arg, "off") || !Q_stricmp(arg, "0"))
-	{
-		Cvar_DirectSet(&sv_packet_dump_player, "");
-		SV_SyncPacketDumpFromCvars();
-		return;
-	}
-
-	if (Cmd_Argc() == 3 && Q_stricmp(Cmd_Argv(2), "anonymized"))
-	{
-		Con_Printf("pktdump: unknown option '%s' (expected 'anonymized')\n", Cmd_Argv(2));
-		return;
-	}
-
-	Cvar_DirectSet(&sv_packet_dump, "1");
-	if (Cmd_Argc() == 3)
-	{
-		char spec[96];
-		Q_snprintf(spec, sizeof(spec), "%s anonymized", arg);
-		Cvar_DirectSet(&sv_packet_dump_player, spec);
-	}
-	else
-	{
-		Cvar_DirectSet(&sv_packet_dump_player, arg);
-	}
-	SV_SyncPacketDumpFromCvars();
-}
 #else // REHLDS_PACKET_DUMP
 void SV_DumpIncomingStringCommand(client_t *client, const char *command)
 {
@@ -4511,6 +4630,19 @@ void SV_ReadPackets(void)
 			if (dumpTarget)
 			{
 				SV_DumpIncomingPacket(cl, "raw_udp", net_message.data, net_message.cursize, msg_readcount);
+
+				if (SV_IsPacketDumpStageEnabled("raw_udp_unmunged") && net_message.cursize > 8 && net_message.cursize <= NET_MAX_MESSAGE)
+				{
+					byte unmungedPacket[NET_MAX_MESSAGE];
+					Q_memcpy(unmungedPacket, net_message.data, net_message.cursize);
+
+					unsigned int sequence;
+					Q_memcpy(&sequence, unmungedPacket, sizeof(sequence));
+					sequence = (unsigned int)LittleLong((int)sequence);
+
+					COM_UnMunge2(&unmungedPacket[8], net_message.cursize - 8, sequence & 0xFF);
+					SV_DumpIncomingPacket(cl, "raw_udp_unmunged", unmungedPacket, net_message.cursize, msg_readcount);
+				}
 			}
 #endif // REHLDS_PACKET_DUMP
 
@@ -8822,9 +8954,6 @@ void SV_Init(void)
 	Cmd_AddCommand("logaddress_add", SV_AddLogAddress_f);
 	Cmd_AddCommand("logaddress_del", SV_DelLogAddress_f);
 	Cmd_AddCommand("log", SV_ServerLog_f);
-#if REHLDS_PACKET_DUMP
-	Cmd_AddCommand("pktdump", SV_PacketDump_f);
-#endif
 	Cmd_AddCommand("serverinfo", SV_Serverinfo_f);
 	Cmd_AddCommand("localinfo", SV_Localinfo_f);
 	Cmd_AddCommand("showinfo", SV_ShowServerinfo_f);
