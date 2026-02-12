@@ -276,14 +276,17 @@ enum
 	PKTDUMP_STAGE_ALL = PKTDUMP_STAGE_RAW_UDP | PKTDUMP_STAGE_RAW_UDP_UNMUNGED | PKTDUMP_STAGE_NETCHAN_PAYLOAD | PKTDUMP_STAGE_FRAGMENT_PAYLOAD | PKTDUMP_STAGE_CLC_STRINGCMD_TEXT
 };
 
+const int PKTDUMP_MAX_TARGETS = 16;
+
 qboolean g_sv_packet_dump_enabled = FALSE;
-USERID_t g_sv_packet_dump_userid;
-char g_sv_packet_dump_userid_str[64] = { 0 };
+USERID_t g_sv_packet_dump_userids[PKTDUMP_MAX_TARGETS];
+char g_sv_packet_dump_userid_str[PKTDUMP_MAX_TARGETS][64] = { 0 };
+int g_sv_packet_dump_userid_count = 0;
 char g_sv_packet_dump_filename[MAX_PATH] = { 0 };
 FileHandle_t g_sv_packet_dump_file = FILESYSTEM_INVALID_HANDLE;
 unsigned int g_sv_packet_dump_counter = 0;
 qboolean g_sv_packet_dump_cfg_enabled = FALSE;
-char g_sv_packet_dump_cfg_target[64] = { 0 };
+char g_sv_packet_dump_cfg_spec[256] = { 0 };
 qboolean g_sv_packet_dump_target_online = FALSE;
 qboolean g_sv_packet_dump_cfg_anonymized = FALSE;
 unsigned int g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
@@ -3992,13 +3995,13 @@ void SV_BuildPacketDumpStageList(unsigned int stageMask, char *out, size_t outSi
 	}
 }
 
-qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t targetSize, qboolean *anonymized, unsigned int *stageMask)
+qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char targets[][64], int maxTargets, int *targetCount, qboolean *anonymized, unsigned int *stageMask)
 {
-	target[0] = 0;
+	*targetCount = 0;
 	*anonymized = FALSE;
 	*stageMask = PKTDUMP_STAGE_ALL;
 
-	if (!spec || !spec[0] || targetSize <= 1)
+	if (!spec || !spec[0] || maxTargets <= 0)
 	{
 		return TRUE;
 	}
@@ -4038,8 +4041,51 @@ qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t tar
 				return FALSE;
 			}
 
-			Q_strncpy(target, value, targetSize - 1);
-			target[targetSize - 1] = 0;
+			char idToken[64];
+			size_t n = 0;
+			for (size_t k = 0; ; k++)
+			{
+				char c = value[k];
+				if (c == ',' || c == 0)
+				{
+					idToken[n] = 0;
+					if (idToken[0])
+					{
+						bool exists = false;
+						for (int t = 0; t < *targetCount; t++)
+						{
+							if (!Q_stricmp(targets[t], idToken))
+							{
+								exists = true;
+								break;
+							}
+						}
+
+						if (!exists)
+						{
+							if (*targetCount >= maxTargets)
+							{
+								return FALSE;
+							}
+
+							Q_strncpy(targets[*targetCount], idToken, 63);
+							targets[*targetCount][63] = 0;
+							(*targetCount)++;
+						}
+					}
+
+					n = 0;
+					if (c == 0)
+						break;
+					continue;
+				}
+
+				if (n + 1 < ARRAYSIZE(idToken))
+				{
+					idToken[n++] = c;
+				}
+			}
+
 			continue;
 		}
 
@@ -4143,10 +4189,11 @@ void SV_StopPacketDump(void)
 
 	g_sv_packet_dump_enabled = FALSE;
 	g_sv_packet_dump_counter = 0;
-	g_sv_packet_dump_userid_str[0] = 0;
+	g_sv_packet_dump_userid_count = 0;
+	Q_memset(g_sv_packet_dump_userids, 0, sizeof(g_sv_packet_dump_userids));
+	Q_memset(g_sv_packet_dump_userid_str, 0, sizeof(g_sv_packet_dump_userid_str));
 	g_sv_packet_dump_filename[0] = 0;
 	g_sv_packet_dump_target_online = FALSE;
-	Q_memset(&g_sv_packet_dump_userid, 0, sizeof(g_sv_packet_dump_userid));
 }
 
 void SV_ClosePacketDumpSession(void)
@@ -4164,39 +4211,68 @@ void SV_ClosePacketDumpSession(void)
 	g_sv_packet_dump_filename[0] = 0;
 }
 
-bool SV_StartPacketDump(const char *steamid)
+bool SV_StartPacketDump(const char targets[][64], int targetCount)
 {
-	if (!steamid || !steamid[0])
+	if (targetCount <= 0)
 	{
-		Con_Printf("pktdump: steamid is empty\n");
+		Con_Printf("pktdump: no steamids configured\n");
 		return false;
 	}
 
-	if (Q_strnicmp(steamid, "STEAM_", 6) && Q_strnicmp(steamid, "VALVE_", 6))
+	if (targetCount > PKTDUMP_MAX_TARGETS)
 	{
-		Con_Printf("pktdump: expected STEAM_X:Y:Z or VALVE_X:Y:Z\n");
+		Con_Printf("pktdump: too many targets (%d), max is %d\n", targetCount, PKTDUMP_MAX_TARGETS);
 		return false;
 	}
 
-	USERID_t *id = SV_StringToUserID(steamid);
-	if (!id || (id->idtype != AUTH_IDTYPE_STEAM && id->idtype != AUTH_IDTYPE_VALVE) || !id->m_SteamID)
+	USERID_t userids[PKTDUMP_MAX_TARGETS];
+	char sourceIds[PKTDUMP_MAX_TARGETS][64];
+	for (int i = 0; i < targetCount; i++)
 	{
-		Con_Printf("pktdump: invalid steamid '%s'\n", steamid);
-		return false;
+		const char *steamid = targets[i];
+		if (!steamid || !steamid[0])
+		{
+			Con_Printf("pktdump: steamid is empty\n");
+			return false;
+		}
+
+		if (Q_strnicmp(steamid, "STEAM_", 6) && Q_strnicmp(steamid, "VALVE_", 6))
+		{
+			Con_Printf("pktdump: expected STEAM_X:Y:Z or VALVE_X:Y:Z\n");
+			return false;
+		}
+
+		USERID_t *id = SV_StringToUserID(steamid);
+		if (!id || (id->idtype != AUTH_IDTYPE_STEAM && id->idtype != AUTH_IDTYPE_VALVE) || !id->m_SteamID)
+		{
+			Con_Printf("pktdump: invalid steamid '%s'\n", steamid);
+			return false;
+		}
+
+		userids[i] = *id;
+		const char *resolvedId = SV_GetIDString(id);
+		const char *sourceId = resolvedId[0] ? resolvedId : steamid;
+		Q_strncpy(sourceIds[i], sourceId, ARRAYSIZE(sourceIds[i]) - 1);
+		sourceIds[i][ARRAYSIZE(sourceIds[i]) - 1] = 0;
 	}
 
 	SV_StopPacketDump();
 
 	char safeId[64];
-	int safeIdLen = 0;
-	const char *resolvedId = SV_GetIDString(id);
-	const char *sourceId = resolvedId[0] ? resolvedId : steamid;
-	for (size_t i = 0; sourceId[i] && safeIdLen < ARRAYSIZE(safeId) - 1; i++)
+	if (targetCount == 1)
 	{
-		char c = sourceId[i];
-		safeId[safeIdLen++] = SV_IsPacketDumpFilenameChar(c) ? c : '_';
+		int safeIdLen = 0;
+		for (size_t i = 0; sourceIds[0][i] && safeIdLen < ARRAYSIZE(safeId) - 1; i++)
+		{
+			char c = sourceIds[0][i];
+			safeId[safeIdLen++] = SV_IsPacketDumpFilenameChar(c) ? c : '_';
+		}
+		safeId[safeIdLen] = 0;
 	}
-	safeId[safeIdLen] = 0;
+	else
+	{
+		Q_snprintf(safeId, sizeof(safeId), "multi_%d_targets", targetCount);
+	}
 
 	const char *logsDir = Cvar_VariableString("logsdir");
 	char baseDir[MAX_PATH];
@@ -4239,40 +4315,53 @@ bool SV_StartPacketDump(const char *steamid)
 		return false;
 	}
 
-	g_sv_packet_dump_userid = *id;
-	Q_strncpy(g_sv_packet_dump_userid_str, sourceId, ARRAYSIZE(g_sv_packet_dump_userid_str) - 1);
-	g_sv_packet_dump_userid_str[ARRAYSIZE(g_sv_packet_dump_userid_str) - 1] = 0;
+	g_sv_packet_dump_userid_count = targetCount;
+	for (int i = 0; i < targetCount; i++)
+	{
+		g_sv_packet_dump_userids[i] = userids[i];
+		Q_strncpy(g_sv_packet_dump_userid_str[i], sourceIds[i], ARRAYSIZE(g_sv_packet_dump_userid_str[i]) - 1);
+		g_sv_packet_dump_userid_str[i][ARRAYSIZE(g_sv_packet_dump_userid_str[i]) - 1] = 0;
+	}
 	g_sv_packet_dump_enabled = TRUE;
 	g_sv_packet_dump_counter = 0;
 
-	const char *logTarget = g_sv_packet_dump_cfg_anonymized ? "******" : g_sv_packet_dump_userid_str;
 	const char *logFile = g_sv_packet_dump_cfg_anonymized ? "******" : g_sv_packet_dump_filename;
-	char logSteamId64[32];
+	char logTargets[512];
+	char logSteamId64[512];
 	char stageList[128];
+	logTargets[0] = 0;
+	logSteamId64[0] = 0;
 	SV_BuildPacketDumpStageList(g_sv_packet_dump_cfg_stage_mask, stageList, sizeof(stageList));
 	if (g_sv_packet_dump_cfg_anonymized)
 	{
+		Q_snprintf(logTargets, sizeof(logTargets), "******");
 		Q_snprintf(logSteamId64, sizeof(logSteamId64), "******");
 	}
 	else
 	{
-		Q_snprintf(logSteamId64, sizeof(logSteamId64), "%lld", (long long)g_sv_packet_dump_userid.m_SteamID);
+		for (int i = 0; i < g_sv_packet_dump_userid_count; i++)
+		{
+			size_t targetsOffset = Q_strlen(logTargets);
+			Q_snprintf(logTargets + targetsOffset, sizeof(logTargets) - targetsOffset, "%s%s", (i == 0) ? "" : ",", g_sv_packet_dump_userid_str[i]);
+
+			size_t steam64Offset = Q_strlen(logSteamId64);
+			Q_snprintf(logSteamId64 + steam64Offset, sizeof(logSteamId64) - steam64Offset, "%s%lld", (i == 0) ? "" : ",", (long long)g_sv_packet_dump_userids[i].m_SteamID);
+		}
 	}
 
 	FS_FPrintf(g_sv_packet_dump_file, "Packet dump started\n");
-	FS_FPrintf(g_sv_packet_dump_file, "target=\"%s\" steamid64=%s realtime=%.3f\n", logTarget, logSteamId64, realtime);
+	FS_FPrintf(g_sv_packet_dump_file, "targets=\"%s\" target_count=%d steamid64=\"%s\" realtime=%.3f\n", logTargets, g_sv_packet_dump_userid_count, logSteamId64, realtime);
 	FS_FPrintf(g_sv_packet_dump_file, "stages=\"%s\"\n", stageList);
 	FS_FPrintf(g_sv_packet_dump_file, "file=\"%s\"\n", logFile);
 	FS_Flush(g_sv_packet_dump_file);
 
-	Con_Printf("pktdump: started for %s, writing to %s\n", g_sv_packet_dump_userid_str, g_sv_packet_dump_filename);
+	Con_Printf("pktdump: started for %d target(s), writing to %s\n", g_sv_packet_dump_userid_count, g_sv_packet_dump_filename);
 	return true;
 }
 
 bool SV_IsPacketDumpTargetOnline(void)
 {
-	if ((g_sv_packet_dump_userid.idtype != AUTH_IDTYPE_STEAM && g_sv_packet_dump_userid.idtype != AUTH_IDTYPE_VALVE)
-		|| !g_sv_packet_dump_userid.m_SteamID)
+	if (g_sv_packet_dump_userid_count <= 0)
 	{
 		return false;
 	}
@@ -4285,9 +4374,12 @@ bool SV_IsPacketDumpTargetOnline(void)
 			continue;
 		}
 
-		if (SV_CompareUserID(&cl->network_userid, &g_sv_packet_dump_userid))
+		for (int t = 0; t < g_sv_packet_dump_userid_count; t++)
 		{
-			return true;
+			if (SV_CompareUserID(&cl->network_userid, &g_sv_packet_dump_userids[t]))
+			{
+				return true;
+			}
 		}
 	}
 
@@ -4296,24 +4388,29 @@ bool SV_IsPacketDumpTargetOnline(void)
 
 void SV_SyncPacketDumpFromCvars(void)
 {
-	char target[sizeof(g_sv_packet_dump_cfg_target)];
-	target[0] = 0;
+	char spec[sizeof(g_sv_packet_dump_cfg_spec)];
+	spec[0] = 0;
+	char targets[PKTDUMP_MAX_TARGETS][64];
+	Q_memset(targets, 0, sizeof(targets));
+	int targetCount = 0;
 	qboolean anonymized = FALSE;
 	unsigned int stageMask = PKTDUMP_STAGE_ALL;
 	qboolean validSpec = TRUE;
 
 	if (sv_packet_dump_player.string && sv_packet_dump_player.string[0])
 	{
-		validSpec = SV_ParsePacketDumpPlayerSpec(sv_packet_dump_player.string, target, ARRAYSIZE(target), &anonymized, &stageMask);
+		TrimSpace(sv_packet_dump_player.string, spec);
+		spec[ARRAYSIZE(spec) - 1] = 0;
+		validSpec = SV_ParsePacketDumpPlayerSpec(spec, targets, ARRAYSIZE(targets), &targetCount, &anonymized, &stageMask);
 		if (!validSpec)
 		{
-			target[0] = 0;
+			targetCount = 0;
 		}
 	}
 
-	qboolean wantEnabled = (sv_packet_dump.value != 0.0f && target[0] != 0) ? TRUE : FALSE;
+	qboolean wantEnabled = (sv_packet_dump.value != 0.0f && targetCount > 0) ? TRUE : FALSE;
 	if (wantEnabled == g_sv_packet_dump_cfg_enabled
-		&& !Q_stricmp(target, g_sv_packet_dump_cfg_target)
+		&& !Q_stricmp(spec, g_sv_packet_dump_cfg_spec)
 		&& anonymized == g_sv_packet_dump_cfg_anonymized
 		&& stageMask == g_sv_packet_dump_cfg_stage_mask)
 	{
@@ -4333,16 +4430,16 @@ void SV_SyncPacketDumpFromCvars(void)
 			if (g_sv_packet_dump_enabled || g_sv_packet_dump_file != FILESYSTEM_INVALID_HANDLE)
 			{
 				SV_ClosePacketDumpSession();
-				Con_Printf("pktdump: target %s disconnected, waiting for next session\n", g_sv_packet_dump_cfg_target);
+				Con_Printf("pktdump: target set disconnected, waiting for next session\n");
 			}
 			g_sv_packet_dump_target_online = FALSE;
 		}
 		else if (!g_sv_packet_dump_target_online && targetOnlineNow)
 		{
-			if (SV_StartPacketDump(g_sv_packet_dump_cfg_target))
+			if (SV_StartPacketDump(targets, targetCount))
 			{
 				g_sv_packet_dump_target_online = TRUE;
-				Con_Printf("pktdump: target %s connected, new session file created\n", g_sv_packet_dump_cfg_target);
+				Con_Printf("pktdump: target set connected, new session file created\n");
 			}
 		}
 
@@ -4350,8 +4447,8 @@ void SV_SyncPacketDumpFromCvars(void)
 	}
 
 	g_sv_packet_dump_cfg_enabled = wantEnabled;
-	Q_strncpy(g_sv_packet_dump_cfg_target, target, ARRAYSIZE(g_sv_packet_dump_cfg_target) - 1);
-	g_sv_packet_dump_cfg_target[ARRAYSIZE(g_sv_packet_dump_cfg_target) - 1] = 0;
+	Q_strncpy(g_sv_packet_dump_cfg_spec, spec, ARRAYSIZE(g_sv_packet_dump_cfg_spec) - 1);
+	g_sv_packet_dump_cfg_spec[ARRAYSIZE(g_sv_packet_dump_cfg_spec) - 1] = 0;
 	g_sv_packet_dump_cfg_anonymized = anonymized;
 	g_sv_packet_dump_cfg_stage_mask = stageMask;
 
@@ -4379,14 +4476,14 @@ void SV_SyncPacketDumpFromCvars(void)
 		return;
 	}
 
-	if (SV_StartPacketDump(target))
+	if (SV_StartPacketDump(targets, targetCount))
 	{
 		g_sv_packet_dump_target_online = SV_IsPacketDumpTargetOnline() ? TRUE : FALSE;
 	}
 	else
 	{
 		g_sv_packet_dump_cfg_enabled = FALSE;
-		g_sv_packet_dump_cfg_target[0] = 0;
+		g_sv_packet_dump_cfg_spec[0] = 0;
 		g_sv_packet_dump_target_online = FALSE;
 		g_sv_packet_dump_cfg_anonymized = FALSE;
 		g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
@@ -4395,7 +4492,7 @@ void SV_SyncPacketDumpFromCvars(void)
 
 bool SV_IsPacketDumpTargetClient(client_t *client)
 {
-	if (!g_sv_packet_dump_enabled || !client)
+	if (!g_sv_packet_dump_enabled || !client || g_sv_packet_dump_userid_count <= 0)
 	{
 		return false;
 	}
@@ -4405,7 +4502,15 @@ bool SV_IsPacketDumpTargetClient(client_t *client)
 		return false;
 	}
 
-	return SV_CompareUserID(&client->network_userid, &g_sv_packet_dump_userid) ? true : false;
+	for (int t = 0; t < g_sv_packet_dump_userid_count; t++)
+	{
+		if (SV_CompareUserID(&client->network_userid, &g_sv_packet_dump_userids[t]))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 void SV_WritePacketDumpHex(const byte *data, int size)
