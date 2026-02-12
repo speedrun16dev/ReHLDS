@@ -4011,7 +4011,7 @@ qboolean SV_ParsePacketDumpPlayerSpec(const char *spec, char *target, size_t tar
 	bool hasStageTokens = false;
 	unsigned int parsedStageMask = 0;
 
-	char token[64];
+	char token[256];
 	while (*s)
 	{
 		while (*s && isspace((unsigned char)*s))
