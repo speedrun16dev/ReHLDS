@@ -4146,8 +4146,6 @@ void SV_StopPacketDump(void)
 	g_sv_packet_dump_userid_str[0] = 0;
 	g_sv_packet_dump_filename[0] = 0;
 	g_sv_packet_dump_target_online = FALSE;
-	g_sv_packet_dump_cfg_anonymized = FALSE;
-	g_sv_packet_dump_cfg_stage_mask = PKTDUMP_STAGE_ALL;
 	Q_memset(&g_sv_packet_dump_userid, 0, sizeof(g_sv_packet_dump_userid));
 }
 
