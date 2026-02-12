@@ -274,6 +274,7 @@ FileHandle_t g_sv_packet_dump_file = FILESYSTEM_INVALID_HANDLE;
 unsigned int g_sv_packet_dump_counter = 0;
 qboolean g_sv_packet_dump_cfg_enabled = FALSE;
 char g_sv_packet_dump_cfg_target[64] = { 0 };
+qboolean g_sv_packet_dump_target_online = FALSE;
 #endif // REHLDS_PACKET_DUMP
 
 delta_t *SV_LookupDelta(char *name)
@@ -3917,7 +3918,7 @@ bool SV_IsPacketDumpFilenameChar(char c)
 
 void SV_StopPacketDump(void)
 {
-	if (!g_sv_packet_dump_enabled)
+	if (!g_sv_packet_dump_enabled && g_sv_packet_dump_file == FILESYSTEM_INVALID_HANDLE)
 	{
 		return;
 	}
@@ -3934,7 +3935,23 @@ void SV_StopPacketDump(void)
 	g_sv_packet_dump_counter = 0;
 	g_sv_packet_dump_userid_str[0] = 0;
 	g_sv_packet_dump_filename[0] = 0;
+	g_sv_packet_dump_target_online = FALSE;
 	Q_memset(&g_sv_packet_dump_userid, 0, sizeof(g_sv_packet_dump_userid));
+}
+
+void SV_ClosePacketDumpSession(void)
+{
+	if (g_sv_packet_dump_file != FILESYSTEM_INVALID_HANDLE)
+	{
+		FS_FPrintf(g_sv_packet_dump_file, "Packet dump session stopped at realtime=%.3f packets=%u\n", realtime, g_sv_packet_dump_counter);
+		FS_Flush(g_sv_packet_dump_file);
+		FS_Close(g_sv_packet_dump_file);
+		g_sv_packet_dump_file = FILESYSTEM_INVALID_HANDLE;
+	}
+
+	g_sv_packet_dump_enabled = FALSE;
+	g_sv_packet_dump_counter = 0;
+	g_sv_packet_dump_filename[0] = 0;
 }
 
 bool SV_StartPacketDump(const char *steamid)
@@ -4027,6 +4044,31 @@ bool SV_StartPacketDump(const char *steamid)
 	return true;
 }
 
+bool SV_IsPacketDumpTargetOnline(void)
+{
+	if ((g_sv_packet_dump_userid.idtype != AUTH_IDTYPE_STEAM && g_sv_packet_dump_userid.idtype != AUTH_IDTYPE_VALVE)
+		|| !g_sv_packet_dump_userid.m_SteamID)
+	{
+		return false;
+	}
+
+	for (int i = 0; i < g_psvs.maxclients; i++)
+	{
+		client_t *cl = &g_psvs.clients[i];
+		if (!cl->connected && !cl->active && !cl->spawned)
+		{
+			continue;
+		}
+
+		if (SV_CompareUserID(&cl->network_userid, &g_sv_packet_dump_userid))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void SV_SyncPacketDumpFromCvars(void)
 {
 	char target[sizeof(g_sv_packet_dump_cfg_target)];
@@ -4041,6 +4083,30 @@ void SV_SyncPacketDumpFromCvars(void)
 	qboolean wantEnabled = (sv_packet_dump.value != 0.0f && target[0] != 0) ? TRUE : FALSE;
 	if (wantEnabled == g_sv_packet_dump_cfg_enabled && !Q_stricmp(target, g_sv_packet_dump_cfg_target))
 	{
+		if (!wantEnabled)
+		{
+			return;
+		}
+
+		bool targetOnlineNow = SV_IsPacketDumpTargetOnline();
+		if (g_sv_packet_dump_target_online && !targetOnlineNow)
+		{
+			if (g_sv_packet_dump_enabled || g_sv_packet_dump_file != FILESYSTEM_INVALID_HANDLE)
+			{
+				SV_ClosePacketDumpSession();
+				Con_Printf("pktdump: target %s disconnected, waiting for next session\n", g_sv_packet_dump_cfg_target);
+			}
+			g_sv_packet_dump_target_online = FALSE;
+		}
+		else if (!g_sv_packet_dump_target_online && targetOnlineNow)
+		{
+			if (SV_StartPacketDump(g_sv_packet_dump_cfg_target))
+			{
+				g_sv_packet_dump_target_online = TRUE;
+				Con_Printf("pktdump: target %s connected, new session file created\n", g_sv_packet_dump_cfg_target);
+			}
+		}
+
 		return;
 	}
 
@@ -4055,10 +4121,20 @@ void SV_SyncPacketDumpFromCvars(void)
 			SV_StopPacketDump();
 			Con_Printf("pktdump: disabled by cvars\n");
 		}
+		g_sv_packet_dump_target_online = FALSE;
 		return;
 	}
 
-	SV_StartPacketDump(target);
+	if (SV_StartPacketDump(target))
+	{
+		g_sv_packet_dump_target_online = SV_IsPacketDumpTargetOnline() ? TRUE : FALSE;
+	}
+	else
+	{
+		g_sv_packet_dump_cfg_enabled = FALSE;
+		g_sv_packet_dump_cfg_target[0] = 0;
+		g_sv_packet_dump_target_online = FALSE;
+	}
 }
 
 bool SV_IsPacketDumpTargetClient(client_t *client)
